@@ -208,12 +208,26 @@ def find_crate_manifest_in_tree(tree: Path, crate_name: str) -> Path:
 
 def copy_and_patch_git_crate_subtree(git_tree: Path, crate_name: str, crate_out_dir: Path) -> None:
 
+    # Identity of the directory a path resolves to. stat() follows symlinks, so
+    # this names the real directory, the way cp(1) tracks its copy ancestors.
+    def dir_id(path: Path) -> tuple[int, int]:
+        st = path.stat()
+        return (st.st_dev, st.st_ino)
+
     # This function will get called by copytree to decide which entries of a directory should be copied
     # We'll copy everything except symlinks that are invalid
     def ignore_func(dir_str: str, path_strs: list[str]) -> list[str]:
         ignorelist: list[str] = []
 
         dir = Path(realpath(dir_str, strict=True))
+
+        # Every directory the walk is currently inside, to catch symlinks that
+        # point back into it. copytree hands this callback only the directory it
+        # is about to descend into, never its recursion stack, so rebuild the
+        # stack from `dir_str`: that is the unresolved path copytree walked, so
+        # its components still name any symlink it descended through. Resolving
+        # it first would erase them.
+        ancestry = {dir_id(p) for p in [Path(dir_str), *Path(dir_str).parents]}
 
         for path_str in path_strs:
             path = dir / path_str
@@ -233,6 +247,16 @@ def copy_and_patch_git_crate_subtree(git_tree: Path, crate_name: str, crate_out_
             if not target_path.is_relative_to(git_tree):
                 ignorelist.append(path_str)
                 eprint(f"Symlink points outside of the crate's base git tree, ignoring: {path} -> {target_path}")
+                continue
+
+            # Filter out directory symlinks pointing back into the subtree being
+            # copied, such as elfutils' `doc/man7 -> .`. They resolve cleanly and
+            # stay inside the git tree, so neither check above rejects them, but
+            # copytree follows directory symlinks and would descend through them
+            # until the kernel runs out of symlink levels.
+            if dir_id(target_path) in ancestry:
+                ignorelist.append(path_str)
+                eprint(f"File system loop found: {path} points to an ancestor {target_path}")
                 continue
 
         return ignorelist
